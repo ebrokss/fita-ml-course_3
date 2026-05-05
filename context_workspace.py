@@ -277,7 +277,10 @@ def call_gemini(config: GeminiConfig, prompt: str) -> str:
         json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
         timeout=60,
     )
-    response.raise_for_status()
+    if not response.ok:
+        raise SystemExit(
+            f"Gemini API kluda ({response.status_code}). Atbilde:\n{response.text}"
+        )
     payload = response.json()
     parts = payload["candidates"][0]["content"]["parts"]
     return "\n".join(part.get("text", "") for part in parts).strip()

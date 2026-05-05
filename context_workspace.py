@@ -328,7 +328,16 @@ def write_text(path: str, content: str) -> None:
 
 
 def command_list_databases(args: argparse.Namespace) -> int:
-    connection = connect(read_db_config(args))
+    config = read_db_config(args)
+    connection = connect(
+        DbConfig(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            database=None,
+        )
+    )
     try:
         print("\n".join(list_databases(connection)))
         return 0

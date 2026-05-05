@@ -438,6 +438,53 @@ Agregatie rezultati JSON:
     return 0
 
 
+def command_all(args: argparse.Namespace) -> int:
+    config = read_db_config(args)
+    if not config.database:
+        raise SystemExit("Noradi DB_NAME .env faila vai --database argumentu.")
+
+    connection = connect(config)
+    try:
+        context = generate_context(connection, config.database, args.tables)
+        write_text(args.context_output, context)
+        print(f"Konteksts saglabats: {args.context_output}")
+    finally:
+        connection.close()
+
+    sql_args = argparse.Namespace(
+        gemini_api_key=args.gemini_api_key,
+        gemini_model=args.gemini_model,
+        question=args.question,
+        context=args.context_output,
+        output=args.sql_output,
+    )
+    command_generate_sql(sql_args)
+
+    run_args = argparse.Namespace(
+        host=args.host,
+        port=args.port,
+        user=args.user,
+        password=args.password,
+        database=args.database,
+        sql=args.sql_output,
+        output=args.result_output,
+        max_rows=args.max_rows,
+    )
+    command_run_sql(run_args)
+
+    describe_args = argparse.Namespace(
+        gemini_api_key=args.gemini_api_key,
+        gemini_model=args.gemini_model,
+        context=args.context_output,
+        sql=args.sql_output,
+        result=args.result_output,
+        output=args.description_output,
+    )
+    command_describe(describe_args)
+    print("Pilna plusma pabeigta.")
+    return 0
+
+
 def add_common_db_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", help="MySQL servera adrese.")
     parser.add_argument("--port", type=int, help="MySQL ports.")
@@ -486,6 +533,30 @@ def parse_args() -> argparse.Namespace:
     describe_parser.add_argument("--result", default="output/result.json", help="Rezultatu JSON fails.")
     describe_parser.add_argument("--output", default="output/description.md", help="Apraksta fails.")
     describe_parser.set_defaults(func=command_describe)
+
+    all_parser = subparsers.add_parser("all", help="Palaist visu plusmu ar vienu komandu.")
+    add_common_db_args(all_parser)
+    add_common_gemini_args(all_parser)
+    all_parser.add_argument("--question", required=True, help="Velamais agregatu raditajs.")
+    all_parser.add_argument("--tables", nargs="+", help="Ieklaut tikai noraditas tabulas konteksta.")
+    all_parser.add_argument(
+        "--context-output",
+        default="output/context.md",
+        help="Konteksta izvades fails.",
+    )
+    all_parser.add_argument("--sql-output", default="output/query.sql", help="SQL izvades fails.")
+    all_parser.add_argument(
+        "--result-output",
+        default="output/result.json",
+        help="Rezultatu JSON izvades fails.",
+    )
+    all_parser.add_argument(
+        "--description-output",
+        default="output/description.md",
+        help="Apraksta izvades fails.",
+    )
+    all_parser.add_argument("--max-rows", type=int, default=200, help="Maksimalais rezultatu rindu skaits.")
+    all_parser.set_defaults(func=command_all)
 
     return parser.parse_args()
 

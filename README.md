@@ -38,6 +38,20 @@ Pieejamas datubazes:
 python context_workspace.py list-databases
 ```
 
+Vienkarsakais variants - palaist visu plusmu ar vienu komandu:
+
+```bash
+python context_workspace.py all \
+  --question "Paradi maksajumu skaitu un kopejo summu pa menesiem"
+```
+
+Sis izveido vai parraksta:
+
+- `output/context.md` - datubazes strukturas konteksts;
+- `output/query.sql` - Gemini generetais SQL;
+- `output/result.json` - agregata SQL rezultats;
+- `output/description.md` - rezultatu apraksts.
+
 Konteksta izveide:
 
 ```bash

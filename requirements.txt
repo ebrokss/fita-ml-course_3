@@ -1,2 +1,3 @@
 mysql-connector-python>=9.0.0
 requests>=2.32.0
+matplotlib>=3.8.0

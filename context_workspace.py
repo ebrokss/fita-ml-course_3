@@ -4,14 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+
+PLAN_SEPARATOR = "---PLAN-ITEM---"
+LAST_GEMINI_CALL_AT = 0.0
 
 
 @dataclass(frozen=True)
@@ -27,6 +33,15 @@ class DbConfig:
 class GeminiConfig:
     api_key: str
     model: str
+
+
+@dataclass(frozen=True)
+class PlanItem:
+    index: int
+    title: str
+    aggregation: str
+    visual_type: str
+    raw_text: str
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -271,12 +286,35 @@ def call_gemini(config: GeminiConfig, prompt: str) -> str:
         raise SystemExit("Nav noradita GEMINI_API_KEY .env faila.")
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.model}:generateContent"
-    response = requests.post(
-        url,
-        headers={"x-goog-api-key": config.api_key, "Content-Type": "application/json"},
-        json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
-        timeout=60,
-    )
+    global LAST_GEMINI_CALL_AT
+    response = None
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        min_interval = float(os.getenv("GEMINI_MIN_INTERVAL_SECONDS", "13"))
+        elapsed = time.monotonic() - LAST_GEMINI_CALL_AT
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+        try:
+            response = requests.post(
+                url,
+                headers={"x-goog-api-key": config.api_key, "Content-Type": "application/json"},
+                json={"contents": [{"role": "user", "parts": [{"text": prompt}]}]},
+                timeout=60,
+            )
+            LAST_GEMINI_CALL_AT = time.monotonic()
+        except requests.RequestException as exc:
+            last_error = exc
+            response = None
+            if attempt < 3:
+                time.sleep(5 * attempt)
+                continue
+            break
+        if response.status_code not in {429, 500, 502, 503, 504}:
+            break
+        if attempt < 3:
+            time.sleep(65 if response.status_code == 429 else 5 * attempt)
+    if response is None:
+        raise SystemExit(f"Gemini API neatgrieza atbildi: {last_error}")
     if not response.ok:
         raise SystemExit(
             f"Gemini API kluda ({response.status_code}). Atbilde:\n{response.text}"
@@ -328,6 +366,496 @@ def write_text(path: str, content: str) -> None:
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(content, encoding="utf-8")
+
+
+def generate_plan_text(gemini: GeminiConfig, context: str, question: str, item_count: int) -> str:
+    prompt = f"""
+Tu esi datu analitikas plansanas asistents. Izmanto tikai zemak doto MySQL datubazes strukturas kontekstu.
+Izveido analitikas planu, ko velak var izpildit ar SQL un Python vizualizacijam.
+
+Noteikumi:
+- Izveido {item_count} plana punktus.
+- Katram punktam jabut realistiski izpildamam ar agregatu SQL no dotajam tabulam.
+- Katram punktam noradi datu apkopojumu, ko vizualizet.
+- Katram punktam noradi vienu vizuala tipu: bar, line, pie, scatter vai table.
+- Neizdomat kolonnas vai tabulas, kas nav konteksta.
+- Starp plana punktiem obligati izmanto atsevisku rindu ar tekstu: {PLAN_SEPARATOR}
+- Neizmanto Markdown tabulas.
+- Katrs plana punkts ir saja forma:
+Nosaukums: ...
+Datu apkopojums: ...
+Vizuala tips: ...
+Pamatojums: ...
+
+Lietotaja merkis:
+{question}
+
+Datubazes konteksts:
+{context}
+""".strip()
+    return call_gemini(gemini, prompt).strip() + "\n"
+
+
+def parse_labeled_value(text: str, labels: list[str]) -> str | None:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        for label in labels:
+            if line.lower().startswith(label.lower() + ":"):
+                return line.split(":", 1)[1].strip()
+    return None
+
+
+def parse_plan(plan_text: str) -> list[PlanItem]:
+    chunks = [chunk.strip() for chunk in plan_text.split(PLAN_SEPARATOR) if chunk.strip()]
+    items: list[PlanItem] = []
+    for index, chunk in enumerate(chunks, start=1):
+        title = parse_labeled_value(chunk, ["Nosaukums", "Title"]) or f"Plana punkts {index}"
+        aggregation = (
+            parse_labeled_value(chunk, ["Datu apkopojums", "Apkopojums", "Aggregation"])
+            or chunk
+        )
+        visual_type = (
+            parse_labeled_value(chunk, ["Vizuala tips", "Visual type", "Chart type"]) or "bar"
+        )
+        items.append(
+            PlanItem(
+                index=index,
+                title=title,
+                aggregation=aggregation,
+                visual_type=visual_type,
+                raw_text=chunk,
+            )
+        )
+    if not items:
+        raise SystemExit(
+            f"Plana fails nesatur punktus. Parbaudi, vai izmantots atdalitajs {PLAN_SEPARATOR}."
+        )
+    return items
+
+
+def generate_sql_for_plan_item(gemini: GeminiConfig, context: str, item: PlanItem) -> str:
+    prompt = f"""
+Tu esi datu analitikas asistents. Izmanto tikai zemak doto MySQL datubazes strukturas kontekstu.
+Uzraksti vienu MySQL SELECT vaicajumu, kas izgus datus sim plana punktam.
+
+Noteikumi:
+- Atbilde satur tikai SQL kodu, bez paskaidrojumiem.
+- Neizmanto INSERT, UPDATE, DELETE, DROP, ALTER, CREATE vai citas datu/strukturas mainisanas komandas.
+- Vaicajumam jabut agregatam vai kopsavilkumam, kas der vizualizacijai.
+- Ierobezo rezultatu apjomu ar ORDER BY un LIMIT, ja var but daudz grupu.
+- Neatlasi visas neapstradatas rindas.
+
+Plana punkts:
+{item.raw_text}
+
+Datubazes konteksts:
+{context}
+""".strip()
+    sql = extract_sql(call_gemini(gemini, prompt))
+    validate_select_sql(sql)
+    return sql
+
+
+def run_sql_text(connection, sql: str, max_rows: int) -> dict[str, Any]:
+    validate_select_sql(sql)
+    cursor = connection.cursor(dictionary=True, buffered=True)
+    try:
+        cursor.execute(sql)
+        rows = cursor.fetchmany(max_rows)
+        return {
+            "sql": sql,
+            "max_rows": max_rows,
+            "rows": [{key: json_safe(value) for key, value in row.items()} for row in rows],
+        }
+    finally:
+        cursor.close()
+
+
+def normalize_visual_type(visual_type: str) -> str:
+    text = visual_type.strip().lower()
+    if any(token in text for token in ["line", "lin", "trend", "laika"]):
+        return "line"
+    if any(token in text for token in ["pie", "aplis", "donut"]):
+        return "pie"
+    if any(token in text for token in ["scatter", "izklied"]):
+        return "scatter"
+    if any(token in text for token in ["table", "tabul"]):
+        return "table"
+    return "bar"
+
+
+def as_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        text = str(value).strip().replace(",", ".")
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def numeric_columns(rows: list[dict[str, Any]]) -> list[str]:
+    if not rows:
+        return []
+    columns = list(rows[0].keys())
+    numeric: list[str] = []
+    for column in columns:
+        values = [as_float(row.get(column)) for row in rows if row.get(column) is not None]
+        if values and len(values) == sum(value is not None for value in values):
+            numeric.append(column)
+    return numeric
+
+
+def label_column(rows: list[dict[str, Any]], excluded: set[str]) -> str | None:
+    if not rows:
+        return None
+    for column in rows[0].keys():
+        if column not in excluded:
+            return column
+    return None
+
+
+def create_visualization(result: dict[str, Any], item: PlanItem, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mpl_config_dir = output_path.parent / ".matplotlib"
+    mpl_config_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config_dir))
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise SystemExit("Trukst matplotlib. Palaid: pip install -r requirements.txt") from exc
+
+    rows = result.get("rows", [])
+    chart_type = normalize_visual_type(item.visual_type)
+
+    fig, ax = plt.subplots(figsize=(10, 5.6), dpi=140)
+    fig.patch.set_facecolor("white")
+    ax.set_title(item.title, fontsize=13, pad=14)
+
+    if not rows:
+        ax.axis("off")
+        ax.text(0.5, 0.5, "Nav datu vizualizacijai", ha="center", va="center", fontsize=12)
+        fig.tight_layout()
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    plot_rows = rows[:30]
+    numeric = numeric_columns(plot_rows)
+
+    if chart_type == "table" or not numeric:
+        ax.axis("off")
+        columns = list(plot_rows[0].keys())
+        table_values = [[markdown_value(row.get(column)) for column in columns] for row in plot_rows]
+        table = ax.table(
+            cellText=table_values,
+            colLabels=columns,
+            loc="center",
+            cellLoc="left",
+            colLoc="left",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(8)
+        table.scale(1, 1.35)
+        fig.tight_layout()
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    if len(plot_rows) == 1 and len(numeric) > 1:
+        labels = numeric
+        values = [as_float(plot_rows[0].get(column)) or 0 for column in numeric]
+        y_label = "Vertiba"
+    else:
+        y_column = numeric[0]
+        x_column = label_column(plot_rows, {y_column}) or y_column
+        labels = [markdown_value(row.get(x_column)) for row in plot_rows]
+        values = [as_float(row.get(y_column)) or 0 for row in plot_rows]
+        y_label = y_column
+
+    if chart_type == "line":
+        ax.plot(labels, values, marker="o", linewidth=2)
+        ax.set_ylabel(y_label)
+        ax.grid(axis="y", alpha=0.25)
+    elif chart_type == "pie" and values and all(value >= 0 for value in values):
+        ax.pie(values, labels=labels, autopct="%1.1f%%", startangle=90)
+        ax.axis("equal")
+    elif chart_type == "scatter" and len(numeric) >= 2:
+        x_column, y_column = numeric[:2]
+        x_values = [as_float(row.get(x_column)) or 0 for row in plot_rows]
+        y_values = [as_float(row.get(y_column)) or 0 for row in plot_rows]
+        ax.scatter(x_values, y_values, s=55)
+        ax.set_xlabel(x_column)
+        ax.set_ylabel(y_column)
+        ax.grid(alpha=0.25)
+    else:
+        ax.bar(labels, values)
+        ax.set_ylabel(y_label)
+        ax.grid(axis="y", alpha=0.25)
+
+    if chart_type in {"bar", "line"}:
+        ax.tick_params(axis="x", rotation=35)
+        for label in ax.get_xticklabels():
+            label.set_horizontalalignment("right")
+
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def describe_visual(gemini: GeminiConfig, context: str, item: PlanItem, result: dict[str, Any]) -> str:
+    prompt = f"""
+Tu esi datu analitikas asistents. Apraksti vizuali un dod konkretus ieskatus latviesu valoda.
+Balsties tikai uz datubazes strukturas kontekstu, plana punktu, SQL un rezultatu JSON.
+
+Atbilde:
+- 1 teikums, ko vizualis rada;
+- 2-4 konkreti ieskati par redzamajiem datiem;
+- piesardzibas piezime, ja metadati nepasaka biznesa nozimi.
+
+Plana punkts:
+{item.raw_text}
+
+Datubazes konteksts:
+{context}
+
+SQL:
+{result.get("sql", "")}
+
+Rezultati JSON:
+{json.dumps(result, ensure_ascii=False, indent=2)}
+""".strip()
+    return call_gemini(gemini, prompt).strip()
+
+
+def html_table(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return "<p>Nav ierakstu.</p>"
+    columns = list(rows[0].keys())
+    header = "".join(f"<th>{html.escape(column)}</th>" for column in columns)
+    body_rows = []
+    for row in rows[:20]:
+        cells = "".join(
+            f"<td>{html.escape(markdown_value(row.get(column)))}</td>" for column in columns
+        )
+        body_rows.append(f"<tr>{cells}</tr>")
+    return f"<table><thead><tr>{header}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+
+
+def build_report_html(
+    database: str,
+    question: str,
+    plan_text: str,
+    processed_items: list[dict[str, Any]],
+    output_path: Path,
+) -> str:
+    item_sections: list[str] = []
+    for processed in processed_items:
+        item = processed["item"]
+        image_path = Path(processed["image_path"])
+        relative_image = os.path.relpath(image_path, start=output_path.parent)
+        result = processed["result"]
+        item_sections.append(
+            f"""
+<section class="visual">
+  <h2>{item.index}. {html.escape(item.title)}</h2>
+  <p class="meta"><strong>Datu apkopojums:</strong> {html.escape(item.aggregation)}<br>
+  <strong>Vizuala tips:</strong> {html.escape(item.visual_type)}</p>
+  <img src="{html.escape(relative_image)}" alt="{html.escape(item.title)}">
+  <div class="description">{markdown_to_simple_html(processed["description"])}</div>
+  <details>
+    <summary>SQL un dati</summary>
+    <pre><code>{html.escape(result.get("sql", ""))}</code></pre>
+    {html_table(result.get("rows", []))}
+  </details>
+</section>
+""".strip()
+        )
+
+    return f"""
+<!doctype html>
+<html lang="lv">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Datu analitikas atskaite</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --text: #1f2933;
+      --muted: #5f6b7a;
+      --border: #d9e2ec;
+      --accent: #176b87;
+      --bg: #f7f9fb;
+      --panel: #ffffff;
+    }}
+    body {{
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+      line-height: 1.55;
+    }}
+    main {{
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 32px 20px 56px;
+    }}
+    header, section {{
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      margin-bottom: 18px;
+    }}
+    h1, h2 {{
+      margin: 0 0 12px;
+      line-height: 1.2;
+    }}
+    h1 {{
+      font-size: 30px;
+    }}
+    h2 {{
+      font-size: 22px;
+    }}
+    .meta {{
+      color: var(--muted);
+      margin: 0 0 16px;
+    }}
+    img {{
+      display: block;
+      width: 100%;
+      max-width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: white;
+    }}
+    pre {{
+      overflow-x: auto;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 14px;
+      border-radius: 6px;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 14px;
+    }}
+    th, td {{
+      border: 1px solid var(--border);
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    th {{
+      background: #eef3f8;
+    }}
+    summary {{
+      cursor: pointer;
+      color: var(--accent);
+      font-weight: 600;
+      margin-top: 14px;
+    }}
+    .description ul {{
+      margin-top: 8px;
+    }}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Datu analitikas atskaite</h1>
+    <p class="meta"><strong>Datubaze:</strong> {html.escape(database)}<br>
+    <strong>Merkis:</strong> {html.escape(question)}</p>
+  </header>
+  <section>
+    <h2>Plans</h2>
+    <pre><code>{html.escape(plan_text)}</code></pre>
+  </section>
+  {"".join(item_sections)}
+</main>
+</body>
+</html>
+""".strip() + "\n"
+
+
+def markdown_to_simple_html(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    html_lines: list[str] = []
+    in_list = False
+    for line in lines:
+        if line.startswith(("- ", "* ")):
+            if not in_list:
+                html_lines.append("<ul>")
+                in_list = True
+            html_lines.append(f"<li>{html.escape(line[2:].strip())}</li>")
+        else:
+            if in_list:
+                html_lines.append("</ul>")
+                in_list = False
+            html_lines.append(f"<p>{html.escape(line)}</p>")
+    if in_list:
+        html_lines.append("</ul>")
+    return "\n".join(html_lines)
+
+
+def process_plan_to_report(
+    db_config: DbConfig,
+    gemini: GeminiConfig,
+    context: str,
+    plan_text: str,
+    question: str,
+    output: str,
+    max_rows: int,
+) -> None:
+    output_path = Path(output)
+    assets_dir = output_path.parent / f"{output_path.stem}_assets"
+    items = parse_plan(plan_text)
+    connection = connect(db_config)
+    processed_items: list[dict[str, Any]] = []
+    try:
+        for item in items:
+            prefix = f"item_{item.index:02d}"
+            sql = generate_sql_for_plan_item(gemini, context, item)
+            result = run_sql_text(connection, sql, max_rows)
+            image_path = assets_dir / f"{prefix}.png"
+            create_visualization(result, item, image_path)
+            description = describe_visual(gemini, context, item, result)
+
+            write_text(str(assets_dir / f"{prefix}.sql"), sql + "\n")
+            write_text(
+                str(assets_dir / f"{prefix}.json"),
+                json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+            )
+            write_text(str(assets_dir / f"{prefix}.md"), description + "\n")
+            processed_items.append(
+                {
+                    "item": item,
+                    "result": result,
+                    "image_path": image_path,
+                    "description": description,
+                }
+            )
+            print(f"Apstradats plana punkts {item.index}: {item.title}")
+    finally:
+        connection.close()
+
+    report = build_report_html(
+        database=db_config.database or "",
+        question=question,
+        plan_text=plan_text,
+        processed_items=processed_items,
+        output_path=output_path,
+    )
+    write_text(str(output_path), report)
 
 
 def command_list_databases(args: argparse.Namespace) -> int:
@@ -438,6 +966,67 @@ Agregatie rezultati JSON:
     return 0
 
 
+def command_generate_plan(args: argparse.Namespace) -> int:
+    gemini = read_gemini_config(args)
+    context = read_text(args.context)
+    plan = generate_plan_text(gemini, context, args.question, args.items)
+    write_text(args.output, plan)
+    print(f"Plans saglabats: {args.output}")
+    return 0
+
+
+def command_process_plan(args: argparse.Namespace) -> int:
+    config = read_db_config(args)
+    if not config.database:
+        raise SystemExit("Noradi DB_NAME .env faila vai --database argumentu.")
+    gemini = read_gemini_config(args)
+    context = read_text(args.context)
+    plan_text = read_text(args.plan)
+    process_plan_to_report(
+        db_config=config,
+        gemini=gemini,
+        context=context,
+        plan_text=plan_text,
+        question=args.question,
+        output=args.output,
+        max_rows=args.max_rows,
+    )
+    print(f"Atskaite saglabata: {args.output}")
+    return 0
+
+
+def command_report(args: argparse.Namespace) -> int:
+    config = read_db_config(args)
+    if not config.database:
+        raise SystemExit("Noradi DB_NAME .env faila vai --database argumentu.")
+    gemini = read_gemini_config(args)
+
+    connection = connect(config)
+    try:
+        context = generate_context(connection, config.database, args.tables)
+    finally:
+        connection.close()
+
+    write_text(args.context_output, context)
+    print(f"Konteksts saglabats: {args.context_output}")
+
+    plan = generate_plan_text(gemini, context, args.question, args.items)
+    write_text(args.plan_output, plan)
+    print(f"Plans saglabats: {args.plan_output}")
+
+    process_plan_to_report(
+        db_config=config,
+        gemini=gemini,
+        context=context,
+        plan_text=plan,
+        question=args.question,
+        output=args.output,
+        max_rows=args.max_rows,
+    )
+    print(f"Atskaite saglabata: {args.output}")
+    return 0
+
+
 def command_all(args: argparse.Namespace) -> int:
     config = read_db_config(args)
     if not config.database:
@@ -533,6 +1122,59 @@ def parse_args() -> argparse.Namespace:
     describe_parser.add_argument("--result", default="output/result.json", help="Rezultatu JSON fails.")
     describe_parser.add_argument("--output", default="output/description.md", help="Apraksta fails.")
     describe_parser.set_defaults(func=command_describe)
+
+    plan_parser = subparsers.add_parser(
+        "generate-plan",
+        help="Generet analitikas planu ar atdalitiem plana punktiem.",
+    )
+    add_common_gemini_args(plan_parser)
+    plan_parser.add_argument("--question", required=True, help="Analitikas merkis.")
+    plan_parser.add_argument("--context", default="output/context.md", help="Konteksta fails.")
+    plan_parser.add_argument("--output", default="output/plan.txt", help="Plana izvades fails.")
+    plan_parser.add_argument("--items", type=int, default=5, help="Plana punktu skaits.")
+    plan_parser.set_defaults(func=command_generate_plan)
+
+    process_parser = subparsers.add_parser(
+        "process-plan",
+        help="Apstradat plana punktus, izveidot SQL, vizualus un HTML atskaiti.",
+    )
+    add_common_db_args(process_parser)
+    add_common_gemini_args(process_parser)
+    process_parser.add_argument("--question", required=True, help="Analitikas merkis atskaitei.")
+    process_parser.add_argument("--context", default="output/context.md", help="Konteksta fails.")
+    process_parser.add_argument("--plan", default="output/plan.txt", help="Plana fails.")
+    process_parser.add_argument("--output", default="output/report.html", help="HTML atskaites fails.")
+    process_parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=200,
+        help="Maksimalais rezultatu rindu skaits katram plana punktam.",
+    )
+    process_parser.set_defaults(func=command_process_plan)
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Palaist pilnu plana, SQL, vizualizaciju un HTML atskaites plusmu.",
+    )
+    add_common_db_args(report_parser)
+    add_common_gemini_args(report_parser)
+    report_parser.add_argument("--question", required=True, help="Analitikas merkis.")
+    report_parser.add_argument("--tables", nargs="+", help="Ieklaut tikai noraditas tabulas konteksta.")
+    report_parser.add_argument("--items", type=int, default=5, help="Plana punktu skaits.")
+    report_parser.add_argument(
+        "--context-output",
+        default="output/context.md",
+        help="Konteksta izvades fails.",
+    )
+    report_parser.add_argument("--plan-output", default="output/plan.txt", help="Plana izvades fails.")
+    report_parser.add_argument("--output", default="output/report.html", help="HTML atskaites fails.")
+    report_parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=200,
+        help="Maksimalais rezultatu rindu skaits katram plana punktam.",
+    )
+    report_parser.set_defaults(func=command_report)
 
     all_parser = subparsers.add_parser("all", help="Palaist visu plusmu ar vienu komandu.")
     add_common_db_args(all_parser)

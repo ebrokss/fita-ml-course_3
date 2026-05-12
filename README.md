@@ -91,3 +91,53 @@ python context_workspace.py generate-sql --question "Velamie agregatie raditaji"
 python context_workspace.py run-sql --sql output/query.sql --output output/result.json
 python context_workspace.py describe --context output/context.md --sql output/query.sql --result output/result.json --output output/description.md
 ```
+
+## Uzdevums B: plans, vizuali un HTML atskaite
+
+Jauna pilna plusma izveido analitikas planu, apstrada katru plana punktu, izveido SQL, izgus datus, saglaba Python vizualizacijas un apvieno rezultatus viena HTML lapa:
+
+```bash
+python context_workspace.py report \
+  --question "Izveido klientu, maksajumu un pasutijumu analitikas atskaiti" \
+  --items 5 \
+  --output output/report.html
+```
+
+Sis izveido vai parraksta:
+
+- `output/context.md` - datubazes strukturas konteksts;
+- `output/plan.txt` - LLM generets plans;
+- `output/report.html` - viena web lapa ar visiem vizualiem, aprakstiem, SQL un datiem;
+- `output/report_assets/` - katra plana punkta SQL, JSON rezultats, apraksts un PNG vizualis.
+
+Plana punktu atdalitajs ir:
+
+```text
+---PLAN-ITEM---
+```
+
+Planam katram punktam ir forma:
+
+```text
+Nosaukums: ...
+Datu apkopojums: ...
+Vizuala tips: bar|line|pie|scatter|table
+Pamatojums: ...
+```
+
+Atseviski var palaist ari divos solos:
+
+```bash
+python context_workspace.py context --output output/context.md
+python context_workspace.py generate-plan \
+  --question "Izveido datu analitikas planu" \
+  --context output/context.md \
+  --output output/plan.txt
+python context_workspace.py process-plan \
+  --question "Izveido datu analitikas planu" \
+  --context output/context.md \
+  --plan output/plan.txt \
+  --output output/report.html
+```
+
+Drosibai riks pirms izpildes valide SQL un atlauj tikai `SELECT` vai `WITH` vaicajumus. Vizualizacijas tiek veidotas ar `matplotlib`.
